@@ -63,7 +63,7 @@ static int usage(const char *argv0, int ret)
 struct MoofOffset {
     int64_t time;
     int64_t offset;
-    int64_t duration;
+    int64_t durationMOOF;
 };
 
 struct Track {
@@ -86,7 +86,7 @@ struct Track {
 
 struct Tracks {
     int nb_tracks;
-    int64_t duration;
+    int64_t durationQQ;
     struct Track **tracks;
     int video_track, audio_track;
     int nb_video_tracks, nb_audio_tracks;
@@ -252,13 +252,20 @@ static int64_t read_trun_duration(AVIOContext *in, int default_duration,
         if (flags & MOV_TRUN_SAMPLE_DURATION) sample_duration = avio_rb32(in);
         if (flags & MOV_TRUN_SAMPLE_SIZE)     avio_rb32(in);
         if (flags & MOV_TRUN_SAMPLE_FLAGS)    avio_rb32(in);
-        if (flags & MOV_TRUN_SAMPLE_CTS)      pts += avio_rb32(in);
+        if (flags & MOV_TRUN_SAMPLE_CTS) {
+            int32_t sample_composition_time_offset = avio_rb32(in);
+            fprintf(stderr, "%d sample_composition_time_offset: %d, pts: %lld\n", __LINE__, sample_composition_time_offset, pts);
+            pts += sample_composition_time_offset;
+            fprintf(stderr, "%d sample_composition_time_offset: %d, pts: %lld\n", __LINE__, sample_composition_time_offset, pts);
+        }
         if (sample_duration < 0) {
             fprintf(stderr, "Negative sample duration %d\n", sample_duration);
             return -1;
         }
         if (i == 0)
             first_pts = pts;
+
+        fprintf(stderr, "%d: max_pts %lld, pts + sample_duration %lld\n", __LINE__, max_pts, pts + sample_duration);
         max_pts = FFMAX(max_pts, pts + sample_duration);
         dts += sample_duration;
         pos = avio_tell(in);
@@ -303,8 +310,10 @@ static int64_t read_moof_duration(AVIOContext *in, int64_t offset)
                         default_duration = avio_rb32(in);
                 }
                 if (tag == MKBETAG('t', 'r', 'u', 'n')) {
-                    return read_trun_duration(in, default_duration,
+                    int64_t trun_duration = read_trun_duration(in, default_duration,
                                               pos + size);
+                    fprintf(stderr, "%d: Return trun duration %lld, default %d\n", __LINE__, trun_duration, default_duration);
+                    return trun_duration;
                 }
                 avio_seek(in, pos + size, SEEK_SET);
             }
@@ -316,6 +325,7 @@ static int64_t read_moof_duration(AVIOContext *in, int64_t offset)
     fprintf(stderr, "Couldn't find traf\n");
 
 fail:
+    fprintf(stderr, "%d: Return fail\n", __LINE__);
     return ret;
 }
 
@@ -363,40 +373,48 @@ static int read_tfra(struct Tracks *tracks, int start_index, AVIOContext *f)
             avio_r8(f);
         for (j = 0; j < ((fieldlength >> 0) & 3) + 1; j++)
             avio_r8(f);
-        if (i > 0)
-            track->offsets[i - 1].duration = track->offsets[i].time -
+        if (i > 0) {
+            track->offsets[i - 1].durationMOOF = track->offsets[i].time -
                                              track->offsets[i - 1].time;
+
+            fprintf(stderr, "%d:  durationMOOF %lld\n", __LINE__, track->offsets[i - 1].durationMOOF);
+        }
     }
     if (track->chunks > 0) {
-        track->offsets[track->chunks - 1].duration = track->offsets[0].time +
+        track->offsets[track->chunks - 1].durationMOOF = track->offsets[0].time +
                                                      track->duration -
                                                      track->offsets[track->chunks - 1].time;
+
+            fprintf(stderr, "%d:  durationMOOF %lld\n", __LINE__, track->offsets[i - 1].durationMOOF);
     }
     // Now try and read the actual durations from the trun sample data.
     for (i = 0; i < track->chunks; i++) {
         int64_t duration = read_moof_duration(f, track->offsets[i].offset);
-        if (duration > 0 && llabs(duration - track->offsets[i].duration) > 3) {
+        fprintf(stderr, "%d:  read_moof_duration %lld\n", __LINE__, duration);
+
+        if (duration > 0 && llabs(duration - track->offsets[i].durationMOOF) > 3) {
             // 3 allows for integer duration to drift a few units,
             // e.g., for 1/3 durations
-            track->offsets[i].duration = duration;
+            track->offsets[i].durationMOOF = duration;
+            fprintf(stderr, "%d:  durationMOOF %lld\n", __LINE__, track->offsets[i].durationMOOF);
         }
     }
     if (track->chunks > 0) {
-        if (track->offsets[track->chunks - 1].duration <= 0) {
+        if (track->offsets[track->chunks - 1].durationMOOF <= 0) {
             fprintf(stderr, "Calculated last chunk duration for track %d "
                     "was non-positive (%"PRId64"), probably due to missing "
                     "fragments ", track->track_id,
-                    track->offsets[track->chunks - 1].duration);
+                    track->offsets[track->chunks - 1].durationMOOF);
             if (track->chunks > 1) {
-                track->offsets[track->chunks - 1].duration =
-                    track->offsets[track->chunks - 2].duration;
+                track->offsets[track->chunks - 1].durationMOOF =
+                    track->offsets[track->chunks - 2].durationMOOF;
             } else {
-                track->offsets[track->chunks - 1].duration = 1;
+                track->offsets[track->chunks - 1].durationMOOF = 1;
             }
             fprintf(stderr, "corrected to %"PRId64"\n",
-                    track->offsets[track->chunks - 1].duration);
+                    track->offsets[track->chunks - 1].durationMOOF);
             track->duration = track->offsets[track->chunks - 1].time +
-                              track->offsets[track->chunks - 1].duration -
+                              track->offsets[track->chunks - 1].durationMOOF -
                               track->offsets[0].time;
             fprintf(stderr, "Track duration corrected to %"PRId64"\n",
                     track->duration);
@@ -563,7 +581,8 @@ static int handle_file(struct Tracks *tracks, const char *file, int split,
             continue;
         }
 
-        tracks->duration = FFMAX(tracks->duration,
+        fprintf(stderr, "Track %d durationQQ %lld, track->duration %lld\n", track->track_id, tracks->durationQQ, av_rescale_rnd(track->duration, AV_TIME_BASE, track->timescale, AV_ROUND_UP));
+        tracks->durationQQ = FFMAX(tracks->durationQQ,
                                  av_rescale_rnd(track->duration, AV_TIME_BASE,
                                                 track->timescale, AV_ROUND_UP));
 
@@ -591,7 +610,7 @@ static int handle_file(struct Tracks *tracks, const char *file, int split,
             track->width  = st->codecpar->width;
             track->height = st->codecpar->height;
             if (st->codecpar->codec_id == AV_CODEC_ID_H264)
-                track->fourcc = "H264";
+                track->fourcc = "AVC1";
             else if (st->codecpar->codec_id == AV_CODEC_ID_VC1)
                 track->fourcc = "WVC1";
             get_video_private_data(track, st->codecpar);
@@ -660,7 +679,7 @@ static void print_track_chunks(FILE *out, struct Tracks *tracks, int main,
     for (i = 0; i < track->chunks; i++) {
         for (j = main + 1; j < tracks->nb_tracks; j++) {
             if (tracks->tracks[j]->is_audio == track->is_audio) {
-                if (track->offsets[i].duration != tracks->tracks[j]->offsets[i].duration) {
+                if (track->offsets[i].durationMOOF != tracks->tracks[j]->offsets[i].durationMOOF) {
                     fprintf(stderr, "Mismatched duration of %s chunk %d in %s (%d) and %s (%d)\n",
                             type, i, track->name, main, tracks->tracks[j]->name, j);
                     should_print_time_mismatch = 1;
@@ -673,13 +692,17 @@ static void print_track_chunks(FILE *out, struct Tracks *tracks, int main,
                 }
             }
         }
-        fprintf(out, "\t\t<c n=\"%d\" d=\"%"PRId64"\" ",
-                i, track->offsets[i].duration);
-        if (pos != track->offsets[i].time) {
-            fprintf(out, "t=\"%"PRId64"\" ", track->offsets[i].time);
-            pos = track->offsets[i].time;
+        fprintf(out, "<c");
+        if (i == track->chunks - 1) {
+            fprintf(out, " t=\"%"PRId64"\"", track->offsets[i].time);
         }
-        pos += track->offsets[i].duration;
+        fprintf(out, " d=\"%"PRId64"\"",
+                track->offsets[i].durationMOOF);
+//        if (pos != track->offsets[i].time) {
+//            fprintf(out, " t=\"%"PRId64"\"", track->offsets[i].time);
+//            pos = track->offsets[i].time;
+//        }
+        pos += track->offsets[i].durationMOOF;
         fprintf(out, "/>\n");
     }
 }
@@ -700,68 +723,68 @@ static void output_client_manifest(struct Tracks *tracks, const char *basename,
         perror(filename);
         return;
     }
-    fprintf(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
-    fprintf(out, "<SmoothStreamingMedia MajorVersion=\"2\" MinorVersion=\"0\" "
-                 "Duration=\"%"PRId64 "\">\n", tracks->duration * 10);
+    fprintf(out, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    fprintf(out, "<SmoothStreamingMedia MajorVersion=\"2\" MinorVersion=\"1\" "
+                 "Duration=\"%"PRId64 "\">\n", tracks->durationQQ * 10);
     if (tracks->video_track >= 0) {
         struct Track *track = tracks->tracks[tracks->video_track];
         struct Track *first_track = track;
         int index = 0;
         fprintf(out,
-                "\t<StreamIndex Type=\"video\" QualityLevels=\"%d\" "
-                "Chunks=\"%d\" "
-                "Url=\"QualityLevels({bitrate})/Fragments(video={start time})\">\n",
-                tracks->nb_video_tracks, track->chunks);
+                "<StreamIndex Type=\"video\" "
+                "Url=\"QualityLevels({bitrate})/Fragments(video={start time})\" "
+                "Name=\"video\" Chunks=\"%d\" QualityLevels=\"%d\">\n",
+                track->chunks, tracks->nb_video_tracks);
         for (i = 0; i < tracks->nb_tracks; i++) {
             track = tracks->tracks[i];
             if (!track->is_video)
                 continue;
             fprintf(out,
-                    "\t\t<QualityLevel Index=\"%d\" Bitrate=\"%d\" "
+                    "<QualityLevel Index=\"%d\" Bitrate=\"%d\" "
                     "FourCC=\"%s\" MaxWidth=\"%d\" MaxHeight=\"%d\" "
                     "CodecPrivateData=\"",
                     index, track->bitrate, track->fourcc, track->width, track->height);
             for (j = 0; j < track->codec_private_size; j++)
-                fprintf(out, "%02X", track->codec_private[j]);
-            fprintf(out, "\" />\n");
+                fprintf(out, "%02x", track->codec_private[j]);
+            fprintf(out, "\"/>\n");
             index++;
             if (track->chunks != first_track->chunks)
                 fprintf(stderr, "Mismatched number of video chunks in %s (id: %d, chunks %d) and %s (id: %d, chunks %d)\n",
                         track->name, track->track_id, track->chunks, first_track->name, first_track->track_id, first_track->chunks);
         }
         print_track_chunks(out, tracks, tracks->video_track, "video");
-        fprintf(out, "\t</StreamIndex>\n");
+        fprintf(out, "</StreamIndex>\n");
     }
     if (tracks->audio_track >= 0) {
         struct Track *track = tracks->tracks[tracks->audio_track];
         struct Track *first_track = track;
         int index = 0;
         fprintf(out,
-                "\t<StreamIndex Type=\"audio\" QualityLevels=\"%d\" "
-                "Chunks=\"%d\" "
-                "Url=\"QualityLevels({bitrate})/Fragments(audio={start time})\">\n",
-                tracks->nb_audio_tracks, track->chunks);
+                "<StreamIndex Type=\"audio\" "
+                "Url=\"QualityLevels({bitrate})/Fragments(audio={start time})\" "
+                "Name=\"audio\" Chunks=\"%d\" QualityLevels=\"%d\">\n",
+                track->chunks, tracks->nb_audio_tracks);
         for (i = 0; i < tracks->nb_tracks; i++) {
             track = tracks->tracks[i];
             if (!track->is_audio)
                 continue;
             fprintf(out,
-                    "\t\t<QualityLevel Index=\"%d\" Bitrate=\"%d\" "
-                    "FourCC=\"%s\" SamplingRate=\"%d\" Channels=\"%d\" "
+                    "<QualityLevel Index=\"%d\" Bitrate=\"%d\" "
+                    "AudioTag=\"%d\" Channels=\"%d\" SamplingRate=\"%d\" "
                     "BitsPerSample=\"16\" PacketSize=\"%d\" "
-                    "AudioTag=\"%d\" CodecPrivateData=\"",
-                    index, track->bitrate, track->fourcc, track->sample_rate,
-                    track->channels, track->blocksize, track->tag);
-            for (j = 0; j < track->codec_private_size; j++)
-                fprintf(out, "%02X", track->codec_private[j]);
-            fprintf(out, "\" />\n");
+                    "FourCC=\"%s\" CodecPrivateData=\"",
+                    index, track->bitrate, track->tag, track->channels,
+                    track->sample_rate, track->blocksize, track->fourcc);
+//            for (j = 0; j < track->codec_private_size; j++)
+//                fprintf(out, "%02x", track->codec_private[j]);
+            fprintf(out, "\"/>\n");
             index++;
             if (track->chunks != first_track->chunks)
                 fprintf(stderr, "Mismatched number of audio chunks in %s and %s\n",
                         track->name, first_track->name);
         }
         print_track_chunks(out, tracks, tracks->audio_track, "audio");
-        fprintf(out, "\t</StreamIndex>\n");
+        fprintf(out, "</StreamIndex>\n");
     }
     fprintf(out, "</SmoothStreamingMedia>\n");
     fclose(out);
